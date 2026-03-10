@@ -12,12 +12,14 @@ const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || "maim1234";
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
-app.use(cors());
+app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"] }));
+app.options("*", cors());
 app.use(express.json());
 
 // ─── Auth Middleware ──────────────────────────────────────────────────────────
 function requireApiKey(req, res, next) {
-  const key = req.headers["x-api-key"];
+  // Accept key from header (POST) or query string (GET proxy links)
+  const key = req.headers["x-api-key"] || req.query["x-api-key"];
   if (!key || key !== API_KEY) {
     return res.status(401).json({ success: false, error: "Unauthorized" });
   }
@@ -148,6 +150,70 @@ app.post("/api/tiktok", requireApiKey, async (req, res) => {
 
     return res.status(500).json({ success: false, error: "TikTok video could not be extracted" });
   }
+});
+
+// ─── Proxy download endpoint ─────────────────────────────────────────────────
+// TikTok CDN blocks direct browser requests (CORS + hotlink protection).
+// This streams the file through our server so the browser can download it.
+app.get("/api/proxy", requireApiKey, async (req, res) => {
+  const { url, filename } = req.query;
+  if (!url) return res.status(400).json({ success: false, error: "Missing url param" });
+
+  let decoded;
+  try { decoded = decodeURIComponent(url); }
+  catch { return res.status(400).json({ success: false, error: "Invalid url param" }); }
+
+  // Allowlist: only TikTok CDN domains
+  if (!/\.(tiktokcdn|tiktokv|muscdn|bytedance|tiktok)\.com/.test(decoded)) {
+    return res.status(403).json({ success: false, error: "URL not allowed" });
+  }
+
+  const https = require("https");
+  const http  = require("http");
+
+  const doRequest = (targetUrl, redirectsLeft = 5) => {
+    const lib = targetUrl.startsWith("https") ? https : http;
+    const proxyReq = lib.get(targetUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "Referer":    "https://www.tiktok.com/",
+        "Accept":     "*/*",
+      },
+      timeout: 30000,
+    }, (proxyRes) => {
+      // Follow redirects
+      if ([301,302,303,307,308].includes(proxyRes.statusCode) && proxyRes.headers.location) {
+        if (redirectsLeft === 0) return res.status(502).json({ success: false, error: "Too many redirects" });
+        proxyRes.resume();
+        return doRequest(proxyRes.headers.location, redirectsLeft - 1);
+      }
+
+      if (proxyRes.statusCode !== 200) {
+        return res.status(proxyRes.statusCode).json({ success: false, error: "CDN error " + proxyRes.statusCode });
+      }
+
+      const name = filename || "tiksave";
+      const ct   = proxyRes.headers["content-type"] || "video/mp4";
+      const ext  = ct.includes("audio") ? "m4a" : "mp4";
+
+      res.setHeader("Content-Type", ct);
+      res.setHeader("Content-Disposition", `attachment; filename="${name}.${ext}"`);
+      if (proxyRes.headers["content-length"]) {
+        res.setHeader("Content-Length", proxyRes.headers["content-length"]);
+      }
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      proxyRes.pipe(res);
+    });
+
+    proxyReq.on("error", (err) => {
+      console.error("[proxy error]", err.message);
+      if (!res.headersSent) res.status(500).json({ success: false, error: "Proxy stream failed" });
+    });
+
+    req.on("close", () => proxyReq.destroy());
+  };
+
+  doRequest(decoded);
 });
 
 // ─── Health check ─────────────────────────────────────────────────────────────
