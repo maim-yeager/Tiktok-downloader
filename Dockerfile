@@ -21,5 +21,5 @@ COPY . .
 # Expose API Port
 EXPOSE 3000
 
-# Start server (Notice the space after CMD)
-CMD["npm", "start"]
+# Start server (Properly spaced!)
+CMD ["npm", "start"]
